@@ -1,0 +1,252 @@
+import os  # Importing the os module to interact with the operating system
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+from telethon import TelegramClient, events
+from telethon.errors import ChatWriteForbiddenError
+import asyncio
+import random
+import time
+import requests
+from datetime import datetime  # Importing datetime module
+
+# Spotify API
+SPOTIPY_CLIENT_ID = '93e89186fa784767853d7886679a39fc'
+SPOTY_CLIENT_SECRET = '2b07faa661c9423b8e0b56f5cafb96fc'
+phone_number = '+918545095514'
+
+# Setup Spotipy with a custom request session
+class TimeoutHTTPAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        self.timeout = kwargs.pop("timeout", None)
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            kwargs["timeout"] = self.timeout
+        return super().send(request, **kwargs)
+
+session = requests.Session()
+adapter = TimeoutHTTPAdapter(timeout=15)
+session.mount("https://", adapter)
+
+# Spotify client with custom session and credentials
+auth_manager = SpotifyClientCredentials(client_id=SPOTIPY_CLIENT_ID, client_secret=SPOTY_CLIENT_SECRET)
+sp = spotipy.Spotify(auth_manager=auth_manager, requests_session=session)
+
+# Your Telegram API credentials
+TOKEN = '7545575493:AAFdwdJWds_UC61KeEgOa3DFvld4VDi-paA'
+API_ID = 27970916
+API_HASH = 'e5a8b1b120667dc76acea5753ba87416'
+
+# Initialize the Telegram client
+client = TelegramClient('session_name', API_ID, API_HASH)
+
+# Global set to store previously suggested songs
+suggested_songs_history = set()
+
+# Function to check and delete session file if it exists
+def check_and_delete_session_file(session_file):
+    retries = 10  # Increase the number of retries
+    wait_time = 2  # Increase wait time between retries
+    for _ in range(retries):
+        try:
+            if os.path.exists(session_file):
+                os.remove(session_file)  # Delete the session file
+                print(f"Deleted existing session file: {session_file}")
+            break  # Exit loop if deletion is successful
+        except PermissionError:
+            print(f"PermissionError: Unable to delete {session_file}. Retrying...")
+            time.sleep(wait_time)  # Wait before retrying
+    else:
+        print(f"Failed to delete {session_file} after {retries} attempts.")
+
+# Function to search for top-rated songs based on mood
+def search_songs(query):
+    start_time = time.time()  # Start time logging
+    query = f"{query} language:hindi"
+    
+    try:
+        result = sp.search(q=query, type='track', limit=50, market='IN')  # Increase limit to 50
+        tracks = result['tracks']['items']
+        sorted_tracks = sorted(tracks, key=lambda x: x['popularity'], reverse=True)
+        sorted_song_names = [f"{track['name']} by {track['artists'][0]['name']}" for track in sorted_tracks]
+
+        new_song_names = [song for song in sorted_song_names if song not in suggested_songs_history]
+        random.shuffle(new_song_names)  # Shuffle the list to ensure variety
+
+    except spotipy.exceptions.SpotifyException as e:
+        print(f"Spotify API Error: {e}")
+        return []
+
+    except requests.exceptions.RequestException as e:
+        print(f"Network Error: {e}")
+        return []
+
+    end_time = time.time()
+    print(f"search_songs took {end_time - start_time} seconds")
+
+    return new_song_names[:5]
+
+# Function to get new released songs
+def get_new_releases():
+    return search_songs("new release")
+
+# Function to get most trending songs
+def get_trending_songs():
+    return search_songs("trending")
+
+# Function to log user commands
+def log_user_command(event, command):
+    chat_id = event.chat_id
+    user_id = event.sender_id
+    username = event.sender.username if event.sender.username else "Unknown"
+    first_name = event.sender.first_name if event.sender.first_name else ""
+    last_name = event.sender.last_name if event.sender.last_name else ""
+    name = f"{first_name} {last_name}".strip()  # Concatenate first and last name
+    group_chat_id = event.is_group if event.is_group else "Private"
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Get current time
+
+    log_entry = (
+        f"Time: {current_time}, User: {username}, Name: {name}, "
+        f"User ID: {user_id}, Chat ID: {chat_id}, Group Chat ID: {group_chat_id}, Command: {command}\n"
+    )
+    
+    with open("user_commands_log.txt", "a", encoding="utf-8") as log_file:
+        log_file.write(log_entry)
+
+# Function to send songs based on mood
+async def send_mood_songs(event, mood):
+    start_time = time.time()
+    chat_id = event.chat_id
+
+    if not mood:
+        await client.send_message(chat_id, "Please specify a mood (e.g., 'romantic song').")
+        return
+
+    print(f"Received mood command in chat_id {chat_id}: {mood}")
+
+    song_names = search_songs(mood)
+
+    if not song_names:
+        await client.send_message(chat_id, "Couldn't find songs for this mood.")
+        return
+
+    for song in song_names:
+        try:
+            print(f"Sending /play command for: {song}")
+            await client.send_message(chat_id, f"/play {song}")
+            suggested_songs_history.add(song)
+            await asyncio.sleep(5)  # Delay to avoid flooding Telegram
+        except ChatWriteForbiddenError:
+            print(f"ChatWriteForbiddenError: Can't send message to chat {chat_id}.")
+            await client.send_message(chat_id, "I can't send messages in this chat.")
+            break  # Stop trying to send more messages
+        except Exception as e:
+            print(f"Error sending song: {e}")
+
+    end_time = time.time()
+    print(f"send_mood_songs took {end_time - start_time} seconds")
+
+# Function to send new released songs
+async def send_new_releases(event):
+    chat_id = event.chat_id
+    new_releases = get_new_releases()
+
+    if not new_releases:
+        await client.send_message(chat_id, "Couldn't find new releases.")
+        return
+
+    for song in new_releases:
+        try:
+            await client.send_message(chat_id, f"/play {song}")
+            suggested_songs_history.add(song)
+            await asyncio.sleep(5)  # Delay to avoid flooding Telegram
+        except ChatWriteForbiddenError:
+            print(f"ChatWriteForbiddenError: Can't send message to chat {chat_id}.")
+            await client.send_message(chat_id, "I can't send messages in this chat.")
+            break  # Stop trying to send more messages
+        except Exception as e:
+            print(f"Error sending song: {e}")
+
+# Function to send trending songs
+async def send_trending_songs(event):
+    chat_id = event.chat_id
+    trending_songs = get_trending_songs()
+
+    if not trending_songs:
+        await client.send_message(chat_id, "Couldn't find trending songs.")
+        return
+
+    for song in trending_songs:
+        try:
+            await client.send_message(chat_id, f"/play {song}")
+            suggested_songs_history.add(song)
+            await asyncio.sleep(5)  # Delay to avoid flooding Telegram
+        except ChatWriteForbiddenError:
+            print(f"ChatWriteForbiddenError: Can't send message to chat {chat_id}.")
+            await client.send_message(chat_id, "I can't send messages in this chat.")
+            break  # Stop trying to send more messages
+        except Exception as e:
+            print(f"Error sending song: {e}")
+
+# Start the bot
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    log_user_command(event, '/start')
+    await event.respond(
+        "Hi! Kaise ho? \n\n"
+        "I can suggest you some songs based on your mood. Just type /mood <your mood> to get started.\n\n"
+        "You can also use the following commands:\n"
+        "/newre - Get the latest new releases\n"
+        "/trnd - Get the trending songs"
+    )
+
+@client.on(events.NewMessage(pattern='/mood (.*)'))
+async def mood(event):
+    mood = event.pattern_match.group(1)
+    log_user_command(event, f'/mood {mood}')
+    await send_mood_songs(event, mood)
+
+@client.on(events.NewMessage(pattern='/newre'))
+async def new_releases(event):
+    log_user_command(event, '/newre')
+    await send_new_releases(event)
+
+@client.on(events.NewMessage(pattern='/trnd'))
+async def trending(event):
+    log_user_command(event, '/trnd')
+    await send_trending_songs(event)
+
+# Function to ping the Spotify API periodically
+async def ping_spotify_api():
+    while True:
+        try:
+            response = sp.search(q="test", type='track', limit=1, market='IN')
+            print("Pinged Spotify API successfully.")
+            print("Response: OKay")
+        except spotipy.exceptions.SpotifyException as e:
+            print(f"Spotify API Error: {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"Network Error: {e}")
+        await asyncio.sleep(60)  # Wait for 1 minute before pinging again
+
+async def main():
+    start_time = time.time()
+        
+    await client.start()
+    print("Bot is running...")
+    # Run the periodic API ping task in the background
+    asyncio.create_task(ping_spotify_api())
+    await client.run_until_disconnected()
+    end_time = time.time()
+    print(f"main took {end_time - start_time} seconds")
+
+# Run the bot
+if __name__ == "__main__":
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+    except RuntimeError as e:
+        print(f"Runtime error: {e}")
+        asyncio.run(main())
